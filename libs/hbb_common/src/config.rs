@@ -108,8 +108,8 @@ pub const RS_PUB_KEY: &str = match option_env!("RS_PUB_KEY") {
     _ => PUBLIC_RS_PUB_KEY,
 };
 
-pub const RENDEZVOUS_PORT: i32 = 42994;
-pub const RELAY_PORT: i32 = 49631;
+pub const RENDEZVOUS_PORT: i32 = 41982;
+pub const RELAY_PORT: i32 = 37252;
 
 macro_rules! serde_field_string {
     ($default_func:ident, $de_func:ident, $default_expr:expr) => {
