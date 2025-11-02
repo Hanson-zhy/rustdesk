@@ -140,7 +140,7 @@ class AbModel {
           debugPrint("pull ab list");
           List<AbProfile> abProfiles = List.empty(growable: true);
           abProfiles.add(AbProfile(_personalAbGuid!, _personalAddressBookName,
-              gFFI.userModel.userName.value, null, ShareRule.read.value));
+              gFFI.userModel.userName.value, null, ShareRule.read.value, null));
           // get all address book name
           await _getSharedAbProfiles(abProfiles);
           addressbooks.removeWhere((key, value) =>
@@ -208,7 +208,7 @@ class AbModel {
         return false;
       }
       Map<String, dynamic> json =
-          _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
       if (json.containsKey('error')) {
         throw json['error'];
       }
@@ -234,7 +234,7 @@ class AbModel {
         return false;
       }
       Map<String, dynamic> json =
-          _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
       if (json.containsKey('error')) {
         throw json['error'];
       }
@@ -271,7 +271,7 @@ class AbModel {
         headers['Content-Type'] = "application/json";
         final resp = await http.post(uri, headers: headers);
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         }
@@ -319,8 +319,8 @@ class AbModel {
 // #endregion
 
 // #region peer
-  Future<String?> addIdToCurrent(
-      String id, String alias, String password, List<dynamic> tags) async {
+  Future<String?> addIdToCurrent(String id, String alias, String password,
+      List<dynamic> tags, String note) async {
     if (currentAbPeers.where((element) => element.id == id).isNotEmpty) {
       return "$id already exists in address book $_currentName";
     }
@@ -332,6 +332,9 @@ class AbModel {
     // avoid set existing password to empty
     if (password.isNotEmpty) {
       peer['password'] = password;
+    }
+    if (note.isNotEmpty) {
+      peer['note'] = note;
     }
     final ret = await addPeersTo([peer], _currentName.value);
     _syncAllFromRecent = true;
@@ -346,6 +349,9 @@ class AbModel {
     final ab = addressbooks[name];
     if (ab == null) {
       return 'no such addressbook: $name';
+    }
+    for (var p in ps) {
+      ab.removeNonExistentTags(p);
     }
     String? errMsg = await ab.addPeers(ps);
     await pullNonLegacyAfterChange(name: name);
@@ -370,6 +376,14 @@ class AbModel {
     await pullNonLegacyAfterChange();
     currentAbPeers.refresh();
     _saveCache();
+    return res;
+  }
+
+  Future<bool> changeNote({required String id, required String note}) async {
+    bool res = await current.changeNote(id: id, note: note);
+    await pullNonLegacyAfterChange();
+    currentAbPeers.refresh();
+    // no need to save cache
     return res;
   }
 
@@ -606,7 +620,7 @@ class AbModel {
             if (name == null || guid == null) {
               continue;
             }
-            ab = Ab(AbProfile(guid, name, '', '', ShareRule.read.value),
+            ab = Ab(AbProfile(guid, name, '', '', ShareRule.read.value, null),
                 name == _personalAddressBookName);
           }
           addressbooks[name] = ab;
@@ -652,6 +666,15 @@ class AbModel {
       return [];
     } else {
       return it.first.tags;
+    }
+  }
+
+  String getPeerNote(String id) {
+    final it = currentAbPeers.where((p0) => p0.id == id);
+    if (it.isEmpty) {
+      return '';
+    } else {
+      return it.first.note;
     }
   }
 
@@ -764,6 +787,28 @@ class AbModel {
     _peerIdUpdateListeners.remove(key);
   }
 
+  String? getdefaultSharedPassword() {
+    if (current.isPersonal()) {
+      return null;
+    }
+    final profile = current.sharedProfile();
+    if (profile == null) {
+      return null;
+    }
+    try {
+      if (profile.info is Map) {
+        final password = (profile.info as Map)['password'];
+        if (password is String && password.isNotEmpty) {
+          return password;
+        }
+      }
+      return null;
+    } catch (e) {
+      debugPrint("getdefaultSharedPassword: $e");
+      return null;
+    }
+  }
+
 // #endregion
 }
 
@@ -775,7 +820,10 @@ abstract class BaseAb {
 
   final pullError = "".obs;
   final pushError = "".obs;
-  final abLoading = false.obs;
+  final abLoading = false
+      .obs; // Indicates whether the UI should show a loading state for the address book.
+  var abPulling =
+      false; // Tracks whether a pull operation is currently in progress to prevent concurrent pulls. Unlike abLoading, this is not tied to UI updates.
   bool initialized = false;
 
   String name();
@@ -790,17 +838,22 @@ abstract class BaseAb {
   }
 
   Future<void> pullAb({quiet = false}) async {
-    debugPrint("pull ab \"${name()}\"");
-    if (abLoading.value) return;
+    if (abPulling) return;
+    abPulling = true;
     if (!quiet) {
       abLoading.value = true;
       pullError.value = "";
     }
     initialized = false;
+    debugPrint("pull ab \"${name()}\"");
     try {
       initialized = await pullAbImpl(quiet: quiet);
-    } catch (_) {}
-    abLoading.value = false;
+    } catch (e) {
+      debugPrint("Error occurred while pulling address book: $e");
+    } finally {
+      abLoading.value = false;
+      abPulling = false;
+    }
   }
 
   Future<bool> pullAbImpl({quiet = false});
@@ -814,9 +867,23 @@ abstract class BaseAb {
     p.remove('password');
   }
 
+  removeNonExistentTags(Map<String, dynamic> p) {
+    try {
+      final oldTags = p.remove('tags');
+      if (oldTags is List) {
+        final newTags = oldTags.where((e) => tagContainBy(e)).toList();
+        p['tags'] = newTags;
+      }
+    } catch (e) {
+      print("removeNonExistentTags: $e");
+    }
+  }
+
   Future<bool> changeTagForPeers(List<String> ids, List<dynamic> tags);
 
   Future<bool> changeAlias({required String id, required String alias});
+
+  Future<bool> changeNote({required String id, required String note});
 
   Future<bool> changePersonalHashPassword(String id, String hash);
 
@@ -902,7 +969,7 @@ class LegacyAb extends BaseAb {
         peers.clear();
       } else if (resp.body.isNotEmpty) {
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (json.containsKey('data')) {
@@ -960,7 +1027,7 @@ class LegacyAb extends BaseAb {
         ret = true;
       } else {
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (resp.statusCode == 200) {
@@ -1043,6 +1110,12 @@ class LegacyAb extends BaseAb {
     }
     it.first.alias = alias;
     return await pushAb();
+  }
+
+  @override
+  Future<bool> changeNote({required String id, required String note}) async {
+    // no need to implement
+    return false;
   }
 
   @override
@@ -1336,7 +1409,7 @@ class Ab extends BaseAb {
         final resp = await http.post(uri, headers: headers);
         statusCode = resp.statusCode;
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         }
@@ -1393,7 +1466,7 @@ class Ab extends BaseAb {
       final resp = await http.post(uri, headers: headers);
       statusCode = resp.statusCode;
       List<dynamic> json =
-          _jsonDecodeRespList(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespList(decode_http_response(resp), resp.statusCode);
       if (resp.statusCode != 200) {
         throw 'HTTP ${resp.statusCode}';
       }
@@ -1500,6 +1573,27 @@ class Ab extends BaseAb {
       return true;
     } catch (err) {
       debugPrint('changeAlias err: ${err.toString()}');
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> changeNote({required String id, required String note}) async {
+    try {
+      final api =
+          "${await bind.mainGetApiServer()}/api/ab/peer/update/${profile.guid}";
+      var headers = getHttpHeaders();
+      headers['Content-Type'] = "application/json";
+      final body = jsonEncode({"id": id, "note": note});
+      final resp = await http.put(Uri.parse(api), headers: headers, body: body);
+      final errMsg = _jsonDecodeActionResp(resp);
+      if (errMsg.isNotEmpty) {
+        BotToast.showText(contentColor: Colors.red, text: errMsg);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      debugPrint('changeNote err: ${err.toString()}');
       return false;
     }
   }
@@ -1767,6 +1861,11 @@ class DummyAb extends BaseAb {
 
   @override
   Future<bool> changeAlias({required String id, required String alias}) async {
+    return false;
+  }
+
+  @override
+  Future<bool> changeNote({required String id, required String note}) async {
     return false;
   }
 
